@@ -12,3 +12,4 @@ wheels/
 data/
 checkpoints/
 runs/
+runs_all_zones/

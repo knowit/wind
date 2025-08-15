@@ -7,6 +7,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.tensorboard import SummaryWriter
 
+from model import SharedPerLocationSum
+
 
 # ----------------------------
 # Dataset
@@ -18,10 +20,7 @@ class WindAreaDataset(Dataset):
         y,
         x_mean=None,
         x_std=None,
-        y_mean=None,
-        y_std=None,
         normalize=True,
-        normalize_y=True,
     ):
         """
         X: (N, L, V) float tensor
@@ -30,13 +29,10 @@ class WindAreaDataset(Dataset):
         self.X = X.float()
         self.y = y.float()
         self.normalize = normalize
-        self.normalize_y = normalize_y
 
         # Stats (computed on the *training* partition and passed in for val)
         self.x_mean = x_mean
         self.x_std = x_std
-        self.y_mean = y_mean
-        self.y_std = y_std
 
     def __len__(self):
         return self.X.shape[0]
@@ -49,48 +45,7 @@ class WindAreaDataset(Dataset):
             # normalize per variable across time+locations using train stats
             x = (x - self.x_mean) / (self.x_std + 1e-6)
 
-        if self.normalize_y and self.y_mean is not None and self.y_std is not None:
-            y = (y - self.y_mean) / (self.y_std + 1e-6)
-
         return x, y
-
-
-# ----------------------------
-# Model: shared per-location MLP + sum
-# ----------------------------
-class SharedPerLocationSum(nn.Module):
-    def __init__(self, in_dim=7, hidden=(64, 32), dropout=0.0, return_locals=False):
-        super().__init__()
-        # h1, h2 = hidden
-        h1, h2, h3 = hidden
-        self.return_locals = return_locals
-        self.phi = nn.Sequential(
-            nn.Linear(in_dim, h1),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h1, h2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(h2, h3),
-            nn.ReLU(),
-            nn.Linear(h3, 1),  # scalar contribution per location
-            nn.Softplus(),
-        )
-
-    def forward(self, x):
-        """
-        x: (B, L, V)
-        returns:
-          y_hat: (B,) predicted total
-          (optionally) loc_contribs: (B, L)
-        """
-        B, L, V = x.shape
-        z = x.view(B * L, V)  # flatten locations
-        contribs = self.phi(z).view(B, L)  # (B, L)
-        y_hat = contribs.sum(dim=1)  # (B,)
-        if self.return_locals:
-            return y_hat, contribs
-        return y_hat
 
 
 # ----------------------------
@@ -105,7 +60,6 @@ def train_model(
     epochs=10,
     val_frac=0.1,
     normalize_x=True,
-    normalize_y=True,
     hidden=(64, 32),
     dropout=0.0,
     seed=42,
@@ -140,19 +94,12 @@ def train_model(
 
     # Train normalization stats
     X_train = base_ds.tensors[0][train_subset.indices]
-    y_train = base_ds.tensors[1][train_subset.indices]
 
     if normalize_x:
         x_mean = X_train.mean(dim=(0, 1)).view(1, V)
         x_std = (X_train.std(dim=(0, 1)) + 1e-6).view(1, V)
     else:
         x_mean = x_std = None
-
-    if normalize_y:
-        y_mean = y_train.mean()
-        y_std = y_train.std() + 1e-6
-    else:
-        y_mean = y_std = None
 
     def wrap_subset(subset):
         X_sub = base_ds.tensors[0][subset.indices]
@@ -162,20 +109,17 @@ def train_model(
             y_sub,
             x_mean,
             x_std,
-            y_mean,
-            y_std,
             normalize=normalize_x,
-            normalize_y=normalize_y,
         )
 
     train_ds = wrap_subset(train_subset)
     val_ds = wrap_subset(val_subset)
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True
+        train_ds, batch_size=batch_size, shuffle=True, pin_memory=True
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True
+        val_ds, batch_size=batch_size, shuffle=False, pin_memory=True
     )
 
     # Model, loss, opt
@@ -189,22 +133,12 @@ def train_model(
         optimizer, T_0=100, T_mult=1, eta_min=1e-5
     )
 
-    def denorm_y(t):
-        return t * y_std.to(t.device) + y_mean.to(t.device) if normalize_y else t
-
     # >>> NEW: SummaryWriter
     writer = None
     if use_tensorboard:
         os.makedirs(log_dir, exist_ok=True)
         run_name = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}__{experiment_name}"
         writer = SummaryWriter(log_dir=os.path.join(log_dir, run_name))
-
-        # Optional: add a graph using one batch (ignore failures if shapes differ)
-        try:
-            xb0, _ = next(iter(train_loader))
-            writer.add_graph(model, xb0.to(device))
-        except Exception:
-            pass
 
         # Hyperparams (logged at end with metrics too)
         writer.add_text(
@@ -216,7 +150,6 @@ def train_model(
                     "batch_size": batch_size,
                     "epochs": epochs,
                     "normalize_x": normalize_x,
-                    "normalize_y": normalize_y,
                     "L": L,
                     "V": V,
                     "model_hidden": hidden,
@@ -269,9 +202,7 @@ def train_model(
                 xb = xb.to(device)
                 yb = yb.to(device)
                 preds = model(xb)
-                rmse_sum += torch.sqrt(
-                    ((denorm_y(preds) - denorm_y(yb)) ** 2).mean()
-                ).item() * xb.size(0)
+                rmse_sum += torch.sqrt(((preds - yb) ** 2).mean()).item() * xb.size(0)
                 n_items += xb.size(0)
             val_rmse = rmse_sum / max(n_items, 1)
         print(
@@ -303,22 +234,21 @@ def train_model(
         model.load_state_dict(best_state)
 
     if writer is not None:
-        hparams = {
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "batch_size": batch_size,
-            "epochs": epochs,
-            "normalize_x": normalize_x,
-            "normalize_y": normalize_y,
-            "L": L,
-            "V": V,
-            "hidden1": hidden[0],
-            "hidden2": hidden[1],
-            "dropout": dropout,
-        }
-        final_metrics = {"hparam/val_MSE": avg_val_loss, "hparam/val_RMSE": val_rmse}
-        # add_hparams writes to a child run directory
-        writer.add_hparams(hparams, final_metrics)
+        # hparams = {
+        #     "lr": lr,
+        #     "weight_decay": weight_decay,
+        #     "batch_size": batch_size,
+        #     "epochs": epochs,
+        #     "normalize_x": normalize_x,
+        #     "L": L,
+        #     "V": V,
+        #     "hidden1": hidden[0],
+        #     "hidden2": hidden[1],
+        #     "dropout": dropout,
+        # }
+        # final_metrics = {"hparam/val_MSE": avg_val_loss, "hparam/val_RMSE": val_rmse}
+        # # add_hparams writes to a child run directory
+        # writer.add_hparams(hparams, final_metrics)
         writer.close()
 
     if save_last:
@@ -334,11 +264,8 @@ def train_model(
             "model_kwargs": {"in_dim": V, "hidden": hidden, "dropout": dropout},
             "state_dict": model.state_dict(),
             "normalize_x": normalize_x,
-            "normalize_y": normalize_y,
             "x_mean": _cpu_or_none(x_mean),
             "x_std": _cpu_or_none(x_std),
-            "y_mean": _cpu_or_none(y_mean),
-            "y_std": _cpu_or_none(y_std),
             "epochs": epochs,
             "final_val_MSE": avg_val_loss,
             "final_val_RMSE": val_rmse,
@@ -348,25 +275,24 @@ def train_model(
         torch.save(ckpt, save_path)
         print(f"[Saved] Last model -> {save_path}")
 
-    return model, (x_mean, x_std, y_mean, y_std)
+    return model, (x_mean, x_std)
 
 
 if __name__ == "__main__":
-    # Tip: pip install tensorboard
     model, stats = train_model(
-        data_path="data/torch_dataset.pt",
+        data_path="data/torch_dataset_all_zones.pt",
         epochs=1000,
         val_frac=0.2,
         batch_size=512,
         lr=1e-2,  # 2e-3,
         early_stopping_patience=120,
-        normalize_y=False,
-        weight_decay=0,
-        hidden=(64, 64, 64),
-        dropout=0.05,
+        weight_decay=1e-4,
+        hidden=(256, 128, 64),
+        dropout=0.1,
         use_tensorboard=True,
-        experiment_name="wind_softplus_cawr_const_T",
-        log_dir="runs",
+        experiment_name="wind_no_workers",
+        log_dir="runs_all_zones",
         save_last=True,
         save_dir="checkpoints",
+        device="cuda:0",
     )
