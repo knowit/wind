@@ -110,7 +110,7 @@ data = (
         # pl.col("bidding_area") == bid_zone,
         pl.col("time_ref") > pl.col("prod_start_new"),
     )
-    .join(windpower, on=["bidding_area", "time"], how="inner")
+    .join(windpower, on=["bidding_area", "time"], how="left")
     .join(weather_nowcast, on=["sid", "time"])
     .with_columns(
         ensemble_mean("ws10m"),
@@ -146,7 +146,7 @@ data = (
 
 # Unique sorted values for dimensions
 forecast_index = (
-    data.select("bidding_area", "time_ref", "time")
+    data.select("bidding_area", "time_ref", "time", "lt")
     .unique(maintain_order=True)
     .collect()
 )
@@ -179,23 +179,26 @@ for i, partition in enumerate(
 
 
 y = (
-    forecast_index.join(windpower.collect(), on=["bidding_area", "time"], how="inner")
+    forecast_index.join(windpower.collect(), on=["bidding_area", "time"], how="left")
     .select("power")
     .to_numpy()[:, 0]
+    .astype(np.float32)
 )
-print(X.shape, y.shape)
+not_missing_idx = ~np.isnan(y)
+print("With missing target:", X.shape, y.shape)
+print("No missing target:", X[not_missing_idx].shape, y[not_missing_idx].shape)
 
-# torch.save(
-#     {
-#         "X": torch.from_numpy(X),  # or convert later on load
-#         "y": torch.from_numpy(y),
-#     },
-#     "data/torch_dataset_all_zones.pt",
-# )
+torch.save(
+    {
+        "X": torch.from_numpy(X[not_missing_idx]),
+        "y": torch.from_numpy(y[not_missing_idx]),
+    },
+    "data/torch_dataset_all_zones.pt",
+)
 
 
 da_forecast_index = pd.MultiIndex.from_frame(
-    forecast_index.to_pandas(), names=["bidding_area", "time_ref", "time"]
+    forecast_index.to_pandas(), names=["bidding_area", "time_ref", "time", "lt"]
 )
 
 da_X = xr.DataArray(
