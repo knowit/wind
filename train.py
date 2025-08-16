@@ -69,7 +69,7 @@ def train_model(
     warmup_epochs = warmup_epochs
     warmup_steps = warmup_epochs * batches_per_epoch
     T0_steps = T0_epochs * batches_per_epoch
-    sched_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    sched_warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
     sched_main = CosineAnnealingWarmRestarts(
         optimizer, T_0=T0_steps, T_mult=1, eta_min=1e-5
     )
@@ -225,14 +225,14 @@ def train_model(
 if __name__ == "__main__":
     model, stats = train_model(
         data_path="data/torch_dataset_all_zones.pt",
-        epochs=1000,
+        epochs=2000,
         val_frac=0.2,
         normalize_x=True,
         batch_size=4 * 1024,
-        lr=2e-2,
+        lr=1e-2,
         warmup_epochs=5,
-        T0_epochs=200,
-        early_stopping_patience=220,
+        T0_epochs=100,
+        early_stopping_patience=110,
         weight_decay=1e-4,
         width=256,
         dropout=0.1,

@@ -1,5 +1,4 @@
 import cf_xarray as cfxr
-import numpy as np
 import polars as pl
 import torch
 import xarray as xr

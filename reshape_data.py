@@ -5,19 +5,18 @@ import polars as pl
 import torch
 import xarray as xr
 
-bid_zone = "ELSPOT NO3"
-zarr_path = "data/weather_forecast.zarr"
 ensemble_member = 0
+weather_forecast_path = "data/met_forecast.parquet"
+weather_nowcast_path = "data/met_nowcast.parquet"
 
-
-TAU = 2 * np.pi  # 2π
+TAU = 2 * np.pi
 hour = pl.col("time").dt.hour().cast(pl.Float64)  # 0..23
 doy = pl.col("time").dt.ordinal_day().cast(pl.Float64)  # 1..365/366
 weekday = pl.col("time").dt.weekday().cast(pl.Float64)
 doy_frac = (doy - 1 + hour / 24.0) / 365.2425  # ~[0,1)
 dow_frac = (weekday - 1 + hour / 24.0) / 7
 
-weather_forecast = pl.scan_parquet("data/met_forecast.parquet")
+weather_forecast = pl.scan_parquet(weather_forecast_path)
 weather_nowcast = pl.scan_parquet("data/met_nowcast.parquet").select(
     pl.col("windpark").alias("sid"),
     "time",
@@ -34,16 +33,7 @@ windpower = (
         (pl.col("bidding_area") == f"ELSPOT NO{k}").alias(f"ELSPOT NO{k}")
         for k in range(1, 5)
     )
-    .with_columns(issue_date=pl.col("time").dt.date())
 )
-
-windpower_prev = windpower.group_by(
-    "bidding_area", issue_date=pl.col("issue_date") + pl.duration(days=1)
-).agg(
-    last_day_mean=pl.col("power").mean(),
-    last_value=pl.col("power").sort_by("time").last(),
-)
-windpower = windpower.join(windpower_prev, on=["bidding_area", "issue_date"])
 
 windparks = pl.scan_csv("data/windparks_enriched.csv", try_parse_dates=True)
 
@@ -64,6 +54,7 @@ def ensemble_std(variable):
 
 # Define dimensions
 features = [
+    "not_missing",
     "lt",
     "operating_power_max",
     "mean_production",
@@ -73,7 +64,7 @@ features = [
     "ELSPOT NO3",
     "ELSPOT NO4",
     "last_day_mean",
-    "last_value",
+    "last_values_mean",
     "ws10m_00",
     "wd10m_00",
     "t2m_00",
@@ -104,7 +95,7 @@ features = [
     "cos_dow",
 ]
 
-data = (
+data_joined = (
     weather_forecast.join(windparks, left_on="sid", right_on="substation_name")
     .filter(
         # pl.col("bidding_area") == bid_zone,
@@ -112,7 +103,28 @@ data = (
     )
     .join(windpower, on=["bidding_area", "time"], how="left")
     .join(weather_nowcast, on=["sid", "time"])
+)
+windpower_features = (
+    data_joined.select("bidding_area", "time_ref")
+    .unique()
+    .join(windpower, on="bidding_area")
+    .filter(
+        pl.col("time") < pl.col("time_ref"),
+        pl.col("time") >= pl.col("time_ref") - pl.duration(hours=24),
+    )
+    .group_by("bidding_area", "time_ref")
+    .agg(
+        last_day_mean=pl.col("power").mean(),
+        last_values_mean=pl.col("power")
+        .filter(pl.col("time") >= pl.col("time_ref") - pl.duration(hours=3))
+        .mean(),
+    )
+)
+
+data = (
+    data_joined.join(windpower_features, on=["bidding_area", "time_ref"], how="left")
     .with_columns(
+        pl.lit(1).alias("not_missing"),
         ensemble_mean("ws10m"),
         ensemble_mean("t2m"),
         ensemble_mean("rh2m"),
