@@ -19,7 +19,7 @@ dow_frac = (weekday - 1 + hour / 24.0) / 7
 weather_forecast = pl.scan_parquet(weather_forecast_path)
 weather_nowcast = pl.scan_parquet("data/met_nowcast.parquet").select(
     pl.col("windpark").alias("sid"),
-    "time",
+    pl.col("time").alias("time_ref"),
     pl.exclude("windpark", "time").name.prefix("now_"),
 )
 windpower = (
@@ -102,7 +102,7 @@ data_joined = (
         pl.col("time_ref") > pl.col("prod_start_new"),
     )
     .join(windpower, on=["bidding_area", "time"], how="left")
-    .join(weather_nowcast, on=["sid", "time"])
+    .join(weather_nowcast, on=["sid", "time_ref"])
 )
 windpower_features = (
     data_joined.select("bidding_area", "time_ref")
@@ -158,7 +158,7 @@ data = (
 
 # Unique sorted values for dimensions
 forecast_index = (
-    data.select("bidding_area", "time_ref", "time", "lt")
+    data.select("time_ref", "time", "lt", "bidding_area")
     .unique(maintain_order=True)
     .collect()
 )
@@ -182,7 +182,7 @@ X = np.zeros(shape, dtype=np.float32)
 # Fill values
 for i, partition in enumerate(
     data.collect(engine="streaming").partition_by(
-        "bidding_area", "time_ref", "time", maintain_order=True
+        "time_ref", "time", "bidding_area", maintain_order=True
     )
 ):
     h = partition.height
@@ -196,8 +196,11 @@ y = (
     .to_numpy()[:, 0]
     .astype(np.float32)
 )
-not_missing_idx = ~np.isnan(y)
-print("With missing target:", X.shape, y.shape)
+X_missing_idx = np.any((np.isnan(X)), axis=(1, 2))
+y_missing_idx = np.isnan(y)
+not_missing_idx = ~X_missing_idx & ~y_missing_idx
+print("X missing:", np.sum(X_missing_idx))
+print("y missing:", np.sum(y_missing_idx))
 print("No missing target:", X[not_missing_idx].shape, y[not_missing_idx].shape)
 
 torch.save(
@@ -210,7 +213,7 @@ torch.save(
 
 
 da_forecast_index = pd.MultiIndex.from_frame(
-    forecast_index.to_pandas(), names=["bidding_area", "time_ref", "time", "lt"]
+    forecast_index.to_pandas(), names=["time_ref", "time", "lt", "bidding_area"]
 )
 
 da_X = xr.DataArray(

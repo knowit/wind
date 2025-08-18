@@ -4,7 +4,7 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR, ConstantLR
 from torch.utils.tensorboard import SummaryWriter
 
 from model import SharedPerLocationSum
@@ -22,6 +22,7 @@ def train_model(
     val_frac,
     normalize_x,
     width,
+    depth,
     dropout,
     seed,
     device=None,
@@ -48,8 +49,9 @@ def train_model(
     # Split
     n_val = int(N * val_frac)
     n_train = N - n_val
-    perm = torch.randperm(N, device=device)
-    train_idx, val_idx = perm[:n_train], perm[n_train:]
+    # perm = torch.randperm(N, device=device)
+    sample_idx = torch.arange(N, device=device) # No shuffle for time sertive eval
+    train_idx, val_idx = sample_idx[:n_train], sample_idx[n_train:]
 
     if normalize_x:
         x_mean = X[train_idx].mean(dim=(0, 1))  # (V,)
@@ -60,22 +62,22 @@ def train_model(
         x_mean = x_std = None
 
     # Model, loss, opt
-    model = SharedPerLocationSum(in_dim=V, width=width, depth=4, dropout=dropout).to(
+    model = SharedPerLocationSum(in_dim=V, width=width, depth=depth, dropout=dropout).to(
         device
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    batches_per_epoch = (train_idx.numel() + batch_size - 1) // batch_size
-    warmup_epochs = warmup_epochs
-    warmup_steps = warmup_epochs * batches_per_epoch
-    T0_steps = T0_epochs * batches_per_epoch
-    sched_warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
-    sched_main = CosineAnnealingWarmRestarts(
-        optimizer, T_0=T0_steps, T_mult=1, eta_min=1e-5
-    )
-    scheduler = SequentialLR(
-        optimizer, schedulers=[sched_warmup, sched_main], milestones=[warmup_steps]
-    )
+    # batches_per_epoch = (train_idx.numel() + batch_size - 1) // batch_size
+    # warmup_epochs = warmup_epochs
+    # warmup_steps = warmup_epochs * batches_per_epoch
+    # T0_steps = T0_epochs * batches_per_epoch
+    # sched_warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
+    # sched_main = CosineAnnealingWarmRestarts(
+    #     optimizer, T_0=T0_steps, T_mult=1, eta_min=1e-5
+    # )
+    # scheduler = SequentialLR(
+    #     optimizer, schedulers=[sched_warmup, sched_main], milestones=[warmup_steps]
+    # )
 
     model.compile()
 
@@ -98,6 +100,7 @@ def train_model(
                     "L": L,
                     "V": V,
                     "width": width,
+                    "depth": depth,
                 }
             ),
         )
@@ -127,8 +130,7 @@ def train_model(
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=20.0)
             optimizer.step()
-            # scheduler.step(epoch - 1 + i * inv_batches)
-            scheduler.step()
+            # scheduler.step()
 
             train_sse += batch_sse.detach()
 
@@ -148,7 +150,8 @@ def train_model(
         val_rmse = torch.sqrt(val_sse / val_idx.numel()).item()
 
         # scheduler.step(avg_val_loss)
-        last_lr = scheduler.get_last_lr()[0]
+        # last_lr = scheduler.get_last_lr()[0]
+        last_lr = lr
         print(
             f"Epoch {epoch:02d} | train MSE: {avg_train_loss:.4f} | val MSE: {avg_val_loss:.4f} | val RMSE: {val_rmse:.3f} | lr: {last_lr:.1e}"
         )
@@ -205,7 +208,7 @@ def train_model(
         # ---- make sure we save CPU copies of normalization stats
         ckpt = {
             "model_class": "SharedPerLocationSum",
-            "model_kwargs": {"in_dim": V, "width": width, "dropout": dropout},
+            "model_kwargs": {"in_dim": V, "width": width, "depth": depth, "dropout": dropout},
             "state_dict": model.state_dict(),
             "normalize_x": normalize_x,
             "x_mean": _cpu_or_none(x_mean),
@@ -225,19 +228,21 @@ def train_model(
 if __name__ == "__main__":
     model, stats = train_model(
         data_path="data/torch_dataset_all_zones.pt",
-        epochs=2000,
+        epochs=300,
         val_frac=0.2,
         normalize_x=True,
         batch_size=4 * 1024,
-        lr=1e-2,
+        lr=1e-3,
         warmup_epochs=5,
-        T0_epochs=100,
-        early_stopping_patience=110,
+        T0_epochs=20,
+        early_stopping_patience=10,
         weight_decay=1e-4,
-        width=256,
+        width=64,
+        depth=3,
+        # width=384,
         dropout=0.1,
         use_tensorboard=True,
-        experiment_name="wind_residual_higher_lr",
+        experiment_name="wind",
         log_dir="runs_all_zones",
         save_last=True,
         save_dir="checkpoints",
