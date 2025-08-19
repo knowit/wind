@@ -64,6 +64,10 @@ features = [
     "ELSPOT NO3",
     "ELSPOT NO4",
     "last_day_mean",
+    "last_day_std",
+    "last_day_min",
+    "last_day_max",
+    "last_value",
     "last_values_mean",
     "ws10m_00",
     "wd10m_00",
@@ -115,6 +119,10 @@ windpower_features = (
     .group_by("bidding_area", "time_ref")
     .agg(
         last_day_mean=pl.col("power").mean(),
+        last_day_std=pl.col("power").std(),
+        last_day_min=pl.col("power").min(),
+        last_day_max=pl.col("power").max(),
+        last_value=pl.col("power").sort_by("time").last(),
         last_values_mean=pl.col("power")
         .filter(pl.col("time") >= pl.col("time_ref") - pl.duration(hours=3))
         .mean(),
