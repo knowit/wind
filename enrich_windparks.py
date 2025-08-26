@@ -7,14 +7,15 @@ windparks_nve = pl.read_csv(
 ).with_columns(
     pl.col("Middelproduksjon [GWh]").str.replace_all(" ", "").cast(pl.Int64),
     windpark_nve=pl.col("Kraftverknavn"),
+    windpark_nve_id=pl.col("KraftverkID"),
 )
 windparks = (
     pl.read_csv("data/windparks_bidzone.csv", try_parse_dates=True)
     .join(windpark_lookup, on="eic_code", how="inner")
-    .with_columns(windpark=pl.col("name"))
+    .with_columns(windpark_name=pl.col("name"))
 )
 windparks_match = windparks.join(
-    windparks_nve, left_on="windpark", right_on="windpark_nve", how="left"
+    windparks_nve, left_on="windpark_name", right_on="windpark_nve", how="left"
 )
 
 mw_per_turbine = windparks_match.select(
@@ -37,7 +38,8 @@ windparks_enriched = (
     .select(
         "bidding_area",
         "substation_name",
-        "name",
+        "windpark_name",
+        "windpark_nve_id",
         "prod_start_new",
         "Fylke",
         "Kommune",

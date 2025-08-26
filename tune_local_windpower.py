@@ -10,6 +10,7 @@ You can run this example as follows:
 
 """
 
+import json
 from datetime import datetime
 
 import optuna
@@ -151,3 +152,13 @@ if __name__ == "__main__":
 
     study.optimize(objective, n_trials=100)
     print(study.best_trial)
+
+    best_params = study.best_params
+    best_params["n_estimators"] = study.best_trial.user_attrs["n_estimators"]
+    best_params["objective"] = "reg:squarederror"
+    best_params["eval_metric"] = "rmse"
+    best_params["device"] = "cuda"
+    best_params["tree_method"] = "hist"
+    study_name = study.study_name
+    with open(f"hparams/{study_name}.json", "w") as f:
+        json.dump(best_params, f)
