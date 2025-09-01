@@ -1,11 +1,12 @@
 [project]
 name = "wind"
 version = "0.1.0"
-description = "Add your description here"
+description = "Prediction of wind power using weather forecast"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "cf-xarray>=0.10.7",
+    "ipywidgets>=8.1.7",
     "matplotlib>=3.10.5",
     "notebook>=7.4.5",
     "optuna>=4.5.0",
@@ -31,9 +32,19 @@ dependencies = [
 extend-include = ["*.ipynb"]
 
 [dependency-groups]
+bayes = [
+    "pymc>=5.25.1",
+]
 geopandas = [
     "geopandas>=1.1.1",
     "folium>=0.20.0",
     "mapclassify>=2.10.0",
     "cartopy>=0.25.0",
 ]
+
+[project.scripts]
+wind = "wind:main"
+
+[build-system]
+requires = ["uv_build>=0.8.11,<0.9.0"]
+build-backend = "uv_build"

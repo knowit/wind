@@ -1,15 +1,3 @@
-"""
-Optuna example that demonstrates a pruner for XGBoost.
-
-In this example, we optimize the validation accuracy of cancer detection using XGBoost.
-We optimize both the choice of booster model and their hyperparameters. Throughout
-training of models, a pruner observes intermediate results and stop unpromising trials.
-
-You can run this example as follows:
-    $ python xgboost_integration.py
-
-"""
-
 import json
 from datetime import datetime
 
@@ -17,6 +5,8 @@ import optuna
 import polars as pl
 import sklearn.metrics
 import xgboost as xgb
+
+from prepare_area_ensemble_data import get_all_features_for_ensemble_member
 
 
 def train_trial(trial, X_train, X_val, y_train, y_val):
@@ -54,14 +44,17 @@ def train_trial(trial, X_train, X_val, y_train, y_val):
         param["skip_drop"] = trial.suggest_float("skip_drop", 1e-8, 1.0, log=True)
 
     # Add a callback for pruning.
-    pruning_callback = optuna.integration.XGBoostPruningCallback(
-        trial, "validation_0-rmse"
-    )
+    # pruning_callback = optuna.integration.XGBoostPruningCallback(
+    #     trial, "validation_0-rmse"
+    # )
     early_stop = xgb.callback.EarlyStopping(
         rounds=10, metric_name="rmse", data_name="validation_0", save_best=True
     )
     model = xgb.XGBRegressor(
-        **param, n_estimators=1000, callbacks=[pruning_callback, early_stop]
+        # **param, n_estimators=1000, callbacks=[pruning_callback, early_stop]
+        **param,
+        n_estimators=1000,
+        callbacks=[early_stop],
     )
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
 
@@ -75,58 +68,14 @@ def train_trial(trial, X_train, X_val, y_train, y_val):
 
 
 if __name__ == "__main__":
+    dataset_path = "data/windpower_area_ensemble_dataset.parquet"
     em = 0
-    features = [
-        "lt",
-        "operating_power_max",
-        "mean_production",
-        "num_turbines",
-        "ELSPOT NO1",
-        "ELSPOT NO2",
-        "ELSPOT NO3",
-        "ELSPOT NO4",
-        f"ws10m_{em:02d}",
-        f"wd10m_{em:02d}",
-        f"t2m_{em:02d}",
-        f"rh2m_{em:02d}",
-        f"mslp_{em:02d}",
-        f"g10m_{em:02d}",
-        "wind_alignment",
-        "ws_magnitude",
-        "ws10m_mean",
-        "t2m_mean",
-        "rh2m_mean",
-        "mslp_mean",
-        "g10m_mean",
-        "ws10m_std",
-        "t2m_std",
-        "rh2m_std",
-        "mslp_std",
-        "g10m_std",
-        "now_air_temperature_2m",
-        "now_air_pressure_at_sea_level",
-        "now_relative_humidity_2m",
-        "now_precipitation_amount",
-        "now_wind_speed_10m",
-        "now_wind_direction_10m",
-        "now_air_density",
-        "location_mean_ws",
-        "now_wind_power_density",
-        "sin_hod",
-        "cos_hod",
-        "sin_doy",
-        "cos_doy",
-        "air_density",
-        "wind_power_scaled",
-        "wind_turbine_scaled",
-        "wind_power_density",
-        "wind_power_density_scaled",
-    ]
-    target = "local_power"
+    features = get_all_features_for_ensemble_member(em)
+    target = "power"
 
     cutoff_date = datetime(2024, 1, 1, 0, 0)
     df = (
-        pl.read_parquet("data/windpower_dataset.parquet")
+        pl.read_parquet(dataset_path)
         .filter(pl.col(target).is_not_null())
         .sort("time_ref", "time", "bidding_area")
     )
@@ -139,16 +88,15 @@ if __name__ == "__main__":
     y_val = df_val.get_column(target)
 
     study = optuna.create_study(
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+        # pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
         direction="minimize",
-        study_name="local_power_xgb_6",
+        study_name="area_power_xgb_1",
         storage="sqlite:///optuna.db",
         load_if_exists=False,
     )
 
     def objective(trial):
         return train_trial(trial, X_train, X_val, y_train, y_val)
-        # return train_trial(trial, df_train, df_val, windpower, features)
 
     study.optimize(objective, n_trials=100)
     print(study.best_trial)

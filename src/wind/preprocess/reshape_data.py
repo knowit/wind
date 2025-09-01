@@ -7,17 +7,7 @@ import polars as pl
 import torch
 import xarray as xr
 
-from prepare_data import FEATURES
-
-# Lagged power features are not available to the local model and are only used for the bidding area model
-lagged_power_features = [
-    "last_day_mean",
-    "last_day_std",
-    "last_day_min",
-    "last_day_max",
-    "last_value",
-    "last_values_mean",
-]
+from prepare_data import get_all_features_for_ensemble_member
 
 
 def add_lagged_windpower(data, windpower):
@@ -50,12 +40,19 @@ windpower = (
     )
 ).unpivot(index="time", variable_name="bidding_area", value_name="power")
 
-local_preds = pl.scan_parquet("data/local_power_pred.parquet").with_columns(
-    local_power_pred=pl.col("local_power_pred").clip(0, None)
+
+em = 0
+local_preds = pl.scan_parquet("data/local_power_pred.parquet").select(
+    "time_ref",
+    "time",
+    "sid",
+    "windpark_name",
+    local_power_pred=pl.col(f"local_power_pred_{em:02d}").clip(0, None),
 )
 
 data = (
-    pl.scan_parquet("data/windpower_dataset.parquet")
+    # pl.scan_parquet("data/windpower_dataset.parquet")
+    pl.scan_parquet("data/windpower_ensemble_dataset.parquet")
     .join(local_preds, on=["time_ref", "time", "windpark_name"])
     .with_columns(mask=pl.lit(True))
     .sort("time_ref", "time", "bidding_area")
@@ -77,8 +74,16 @@ num_stations = (
     .item()
 )
 
-
-features = [*FEATURES, "local_power_pred", "mask"]
+# Lagged power features are not available to the local model and are only used for the bidding area model
+lagged_power_features = [
+    "last_day_mean",
+    "last_day_std",
+    "last_day_min",
+    "last_day_max",
+    "last_value",
+    "last_values_mean",
+]
+features = [*get_all_features_for_ensemble_member(em), "local_power_pred", "mask"]
 num_features = len(features)
 
 

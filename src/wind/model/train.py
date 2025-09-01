@@ -16,6 +16,7 @@ from torch.optim.lr_scheduler import (
 from torch.utils.tensorboard import SummaryWriter
 
 from model import LatentSpaceSum, SharedPerLocationSum
+from prepare_ensemble_data import get_all_features_for_ensemble_member
 
 
 def train_model(
@@ -397,8 +398,9 @@ def train(
 
 
 if __name__ == "__main__":
+    data_path = "data/windpower_ensemble_dataset.parquet"
     em = 0
-    features = None
+    features = get_all_features_for_ensemble_member(em)
     for i, bidding_area in enumerate(
         ["ELSPOT NO1", "ELSPOT NO2", "ELSPOT NO3", "ELSPOT NO4"]
     ):
