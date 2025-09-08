@@ -6,7 +6,7 @@ windparks_nve = pl.read_csv(
     "data/windparks_nve.csv", separator=";", decimal_comma=True
 ).with_columns(
     pl.col("Middelproduksjon [GWh]").str.replace_all(" ", "").cast(pl.Int64),
-    windpark_nve=pl.col("Kraftverknavn"),
+    windpark_name_nve=pl.col("Kraftverknavn"),
     windpark_nve_id=pl.col("KraftverkID"),
 )
 windparks = (
@@ -15,7 +15,7 @@ windparks = (
     .with_columns(windpark_name=pl.col("name"))
 )
 windparks_match = windparks.join(
-    windparks_nve, left_on="windpark_name", right_on="windpark_nve", how="left"
+    windparks_nve, left_on="windpark_name", right_on="windpark_name_nve", how="left"
 )
 
 mw_per_turbine = windparks_match.select(

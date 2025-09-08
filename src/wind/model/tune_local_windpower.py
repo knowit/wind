@@ -1,26 +1,16 @@
-"""
-Optuna example that demonstrates a pruner for XGBoost.
-
-In this example, we optimize the validation accuracy of cancer detection using XGBoost.
-We optimize both the choice of booster model and their hyperparameters. Throughout
-training of models, a pruner observes intermediate results and stop unpromising trials.
-
-You can run this example as follows:
-    $ python xgboost_integration.py
-
-"""
-
 import json
 from datetime import datetime
+from typing import Iterable
 
 import optuna
 import polars as pl
 import sklearn.metrics
 import xgboost as xgb
-from typing import Iterable
+
+from wind.preprocess.prepare_local_data import LOCAL_FEATURES
 
 
-def xgb_trial(trial, X_train, X_val, y_train, y_val):
+def xgb_trial(trial, X_train, X_val, y_train, y_val, w_train, w_val):
     fixed_params = {
         "verbosity": 0,
         "objective": "reg:squarederror",
@@ -47,38 +37,57 @@ def xgb_trial(trial, X_train, X_val, y_train, y_val):
     pruning_callback = optuna.integration.XGBoostPruningCallback(
         trial, "validation_0-rmse"
     )
-    early_stop = xgb.callback.EarlyStopping(
+    early_stop = xgb.callback.EarlyStopping(  # type: ignore
         rounds=10, metric_name="rmse", data_name="validation_0", save_best=True
     )
     model = xgb.XGBRegressor(
         **param, n_estimators=1000, callbacks=[pruning_callback, early_stop]
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+    model.fit(X_train, y_train, sample_weight=w_train, eval_set=[(X_val, y_val)])
 
     trial.set_user_attr("fixed_params", fixed_params)
     best_iter = getattr(model, "best_iteration", None)
+    if best_iter is None:
+        raise ValueError(
+            "No iterations found to select best iteration. Something likely went wrong during training."
+        )
     trial.set_user_attr("n_estimators", int(best_iter) + 1)
 
     preds = model.predict(X_val)
-    rmse = sklearn.metrics.root_mean_squared_error(y_val, preds)
+    rmse = sklearn.metrics.root_mean_squared_error(y_val, preds, sample_weight=w_val)
     return rmse
 
-def get_split_data(dataset_path: str, val_start_date: datetime, features: Iterable[str], target: str) -> tuple[pl.DataFrame, pl.Series, pl.DataFrame, pl.Series]:
-    df = (
-        pl.scan_parquet(dataset_path)
-        .filter(pl.col(target).is_not_null(), pl.col("lt") <= 48)
-    )
-    df_train = df.filter(pl.col("time_ref") < val_start_date)
-    df_val = df.filter(pl.col("time_ref") >= val_start_date)
-    X_train = df_train.select(features).collect()
-    y_train = df_train.select(target).collect().to_series()
-    X_val = df_val.select(features).collect()
-    y_val = df_val.select(target).collect().to_series()
-    return X_train, y_train, X_val, y_val
 
-def tune_xgb_model(X_train, y_train, X_val, y_val, study_name):
+def get_split_data(
+    data: pl.LazyFrame,
+    val_start_date: datetime,
+    features: Iterable[str],
+    target: str,
+    weight: str | None = None,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.Series, pl.Series, pl.Series, pl.Series]:
+    data_train = data.filter(pl.col("time_ref") < val_start_date).filter(
+        pl.col("em") == 0
+    )
+    data_val = data.filter(pl.col("time_ref") >= val_start_date)
+
+    X_train = data_train.select(features).collect()
+    X_val = data_val.select(features).collect()
+
+    y_train = data_train.select(target).collect().to_series()
+    y_val = data_val.select(target).collect().to_series()
+
+    if weight is None:
+        w_train = pl.ones(y_train.len(), eager=True)
+        w_val = pl.ones(y_val.len(), eager=True)
+    else:
+        w_train = data_train.select(weight).collect().to_series()
+        w_val = data_val.select(weight).collect().to_series()
+    return X_train, X_val, y_train, y_val, w_train, w_val
+
+
+def tune_xgb_model(X_train, X_val, y_train, y_val, w_train, w_val, study_name):
     study = optuna.create_study(
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=25),
         direction="minimize",
         study_name=study_name,
         storage="sqlite:///optuna.db",
@@ -86,7 +95,7 @@ def tune_xgb_model(X_train, y_train, X_val, y_val, study_name):
     )
 
     def objective(trial):
-        return xgb_trial(trial, X_train, X_val, y_train, y_val)
+        return xgb_trial(trial, X_train, X_val, y_train, y_val, w_train, w_val)
 
     study.optimize(objective, n_trials=100)
     print(study.best_trial)
@@ -100,23 +109,43 @@ def tune_xgb_model(X_train, y_train, X_val, y_val, study_name):
 
 
 def main():
-
-    from prepare_single_model_data import FEATURES
-    study_name = "single_model_xgb"
-    dataset_path = "data/windpower_single_model_dataset.parquet"
-    features = FEATURES
-
-    # from prepare_ensemble_data import SHARED_FEATURES, get_ensemble_member_features
-    # study_name = "model_per_em_xgb"
-    # dataset_path = "data/windpower_ensemble_dataset.parquet"
-    # em = 0
-    # features = [*SHARED_FEATURES, *get_ensemble_member_features(em)]
-
+    dataset_path = "data/windpower_local_dataset.parquet"
+    features = LOCAL_FEATURES
     val_start_date = datetime(2024, 1, 1, 0, 0)
-    target = "local_power"
-    X_train, y_train, X_val, y_val = get_split_data(dataset_path, val_start_date, features, target)
-    tune_xgb_model(X_train, y_train, X_val, y_val, study_name)
+    target = "local_relative_power"
+    weight = "operating_power_max"
+
+    study_name = "em0_model_xgb_2"
+    data = pl.scan_parquet(dataset_path).filter(
+        pl.col(target).is_not_null(), pl.col("lt") <= 48
+    )
+
+    X_train, X_val, y_train, y_val, w_train, w_val = get_split_data(
+        data, val_start_date, features, target, weight
+    )
+    tune_xgb_model(X_train, X_val, y_train, y_val, w_train, w_val, study_name)
+
+
+def main_area():
+    from wind.preprocess.prepare_area_data import AREA_FEATURES
+
+    dataset_path = "data/windpower_area_dataset.parquet"
+    features = AREA_FEATURES
+    val_start_date = datetime(2025, 1, 1, 0, 0)
+    target = "relative_power"
+    weight = "operating_power_max"
+
+    study_name = "em0_area_model_xgb_2"
+    data = pl.scan_parquet(dataset_path).filter(
+        pl.col(target).is_not_null(), pl.col("lt") <= 48
+    )
+
+    X_train, X_val, y_train, y_val, w_train, w_val = get_split_data(
+        data, val_start_date, features, target, weight
+    )
+    tune_xgb_model(X_train, X_val, y_train, y_val, w_train, w_val, study_name)
 
 
 if __name__ == "__main__":
     main()
+    # main_area()

@@ -1,21 +1,19 @@
-from itertools import chain
-
 import numpy as np
 import polars as pl
 
-TAU = 2 * np.pi
-
 ENSEMBLE_MEMBERS = list(range(15))
 
-SHARED_FEATURES = [
+LOCAL_FEATURES = [
     "lt",
-    "operating_power_max",
-    "mean_production",
-    "num_turbines",
     "ELSPOT NO1",
     "ELSPOT NO2",
     "ELSPOT NO3",
     "ELSPOT NO4",
+    "sin_hod",
+    "cos_hod",
+    "sin_doy",
+    "cos_doy",
+    "location_mean_ws",
     "now_air_temperature_2m",
     "now_air_pressure_at_sea_level",
     "now_relative_humidity_2m",
@@ -23,15 +21,8 @@ SHARED_FEATURES = [
     "now_wind_speed_10m",
     "now_wind_direction_10m",
     "now_air_density",
-    "location_mean_ws",
+    "now_wind_alignment",
     "now_wind_power_density",
-    "sin_hod",
-    "cos_hod",
-    "sin_doy",
-    "cos_doy",
-]
-
-ENSEMBLE_FEATURES = [
     "ws10m",
     "wd10m",
     "t2m",
@@ -41,90 +32,61 @@ ENSEMBLE_FEATURES = [
     "wind_alignment",
     "air_density",
     "gust_factor",
-    "ws_power_scaled",
-    "ws_turbine_scaled",
     "wind_power_density",
-    "wind_power_density_scaled",
 ]
 
 
-def get_ensemble_member_features(em: int) -> list[str]:
-    return [f"{feature_name}_{em:02d}" for feature_name in ENSEMBLE_FEATURES]
+def air_density() -> pl.Expr:
+    return (pl.col("mslp") / (273.15 + pl.col("t2m"))).alias("air_density")
 
 
-def get_all_features_for_ensemble_member(em: int) -> list[str]:
-    return [*SHARED_FEATURES, *get_ensemble_member_features(em)]
+def wind_x() -> pl.Expr:
+    return (pl.col("ws10m") * (TAU * pl.col("wd10m") / 360).cos()).alias("wind_x")
 
 
-def get_all_ensemble_features() -> list[str]:
-    return chain.from_iterable(
-        get_ensemble_member_features(em) for em in ENSEMBLE_MEMBERS
-    )
+def wind_y() -> pl.Expr:
+    return (pl.col("ws10m") * (TAU * pl.col("wd10m") / 360).sin()).alias("wind_y")
 
 
-def air_density(em: int) -> pl.Expr:
-    return (pl.col(f"mslp_{em:02d}") / (273.15 + pl.col(f"t2m_{em:02d}"))).alias(
-        f"air_density_{em:02d}"
-    )
+def ws_power_scaled() -> pl.Expr:
+    return (pl.col("ws10m") * pl.col("operating_power_max")).alias("ws_power_scaled")
 
 
-def wind_x(em: int) -> pl.Expr:
-    return pl.col(f"ws10m_{em:02d}") * (
-        TAU * pl.col(f"wd10m_{em:02d}") / 360
-    ).cos().alias(f"wind_x_{em:02d}")
+def ws_turbine_scaled() -> pl.Expr:
+    return (pl.col("ws10m") * pl.col("num_turbines")).alias("ws_turbine_scaled")
 
 
-def wind_y(em: int) -> pl.Expr:
-    return pl.col(f"ws10m_{em:02d}") * (
-        TAU * pl.col(f"wd10m_{em:02d}") / 360
-    ).sin().alias(f"wind_y_{em:02d}")
+def gust_factor() -> pl.Expr:
+    return (pl.col("g10m") / pl.col("ws10m")).alias("gust_factor")
 
 
-def ws_power_scaled(em: int) -> pl.Expr:
-    return (pl.col(f"ws10m_{em:02d}") * pl.col("operating_power_max")).alias(
-        f"ws_power_scaled_{em:02d}"
-    )
-
-
-def ws_turbine_scaled(em: int) -> pl.Expr:
-    return (pl.col(f"ws10m_{em:02d}") * pl.col("num_turbines")).alias(
-        f"ws_turbine_scaled_{em:02d}"
-    )
-
-
-def gust_factor(em: int) -> pl.Expr:
-    return (pl.col(f"g10m_{em:02d}") / pl.col(f"ws10m_{em:02d}")).alias(
-        f"gust_factor_{em:02d}"
-    )
-
-
-def wind_alignment(em: int) -> pl.Expr:
+def wind_alignment() -> pl.Expr:
     return (
         (
-            pl.col(f"wind_x_{em:02d}")
-            .rolling_mean(5, min_samples=1, center=True)
+            pl.col("wind_x")
+            .rolling_mean(3, min_samples=1, center=True)
             .over(["time_ref", "windpark_name"], order_by="lt")
             ** 2
-            + pl.col(f"wind_y_{em:02d}")
-            .rolling_mean(5, min_samples=1, center=True)
+            + pl.col("wind_y")
+            .rolling_mean(3, min_samples=1, center=True)
             .over(["time_ref", "windpark_name"], order_by="lt")
             ** 2
         )
         .sqrt()
-        .alias(f"wind_alignment_{em:02d}")
+        .alias("wind_alignment")
     )
 
 
-def wind_power_density(em: int) -> pl.Expr:
-    return (
-        pl.col(f"air_density_{em:02d}") * pl.col(f"ws10m_{em:02d}").clip(0, 20) ** 3
-    ).alias(f"wind_power_density_{em:02d}")
+def wind_power_density() -> pl.Expr:
+    return (pl.col("air_density") * pl.col("ws10m").clip(0, 20) ** 3).alias(
+        "wind_power_density"
+    )
 
 
-def wind_power_density_scaled(em: int) -> pl.Expr:
-    return (
-        pl.col(f"wind_power_density_{em:02d}") * pl.col("operating_power_max")
-    ).alias(f"wind_power_density_scaled_{em:02d}")
+def wind_power_density_scaled() -> pl.Expr:
+    return (pl.col("wind_power_density") * pl.col("operating_power_max")).alias(
+        "wind_power_density_scaled"
+    )
 
 
 def get_local_windpower(path: str) -> pl.LazyFrame:
@@ -162,35 +124,54 @@ def get_local_windpower(path: str) -> pl.LazyFrame:
     return local_windpower
 
 
+def get_weather_forecast(path: str) -> pl.LazyFrame:
+    weather_forecast_ensemble_data = []
+    for em in ENSEMBLE_MEMBERS:
+        em_weather_forecast = pl.scan_parquet(path).select(
+            "sid",
+            "time_ref",
+            "time",
+            "lt",
+            pl.lit(em).alias("em"),
+            pl.col(f"ws10m_{em:02d}").alias("ws10m"),
+            pl.col(f"wd10m_{em:02d}").alias("wd10m"),
+            pl.col(f"t2m_{em:02d}").alias("t2m"),
+            pl.col(f"rh2m_{em:02d}").alias("rh2m"),
+            pl.col(f"mslp_{em:02d}").alias("mslp"),
+            pl.col(f"g10m_{em:02d}").alias("g10m"),
+        )
+        weather_forecast_ensemble_data.append(em_weather_forecast)
+
+    weather_forecast = pl.concat(weather_forecast_ensemble_data).with_columns(
+        wind_x(), wind_y()
+    )
+    return weather_forecast
+
+
 if __name__ == "__main__":
+    forecast_horizon = 48
     weather_forecast_path = "data/met_forecast.parquet"
     weather_nowcast_path = "data/met_nowcast.parquet"
+
+    TAU = 2 * np.pi
     hour = pl.col("time").dt.hour().cast(pl.Float64)  # 0..23
     doy = pl.col("time").dt.ordinal_day().cast(pl.Float64)  # 1..365/366
     doy_frac = (doy - 1 + hour / 24.0) / 365.2425  # ~[0,1)
 
-    weather_forecast = pl.scan_parquet(weather_forecast_path).with_columns(
-        *(wind_x(em) for em in ENSEMBLE_MEMBERS),
-        *(wind_y(em) for em in ENSEMBLE_MEMBERS),
-    )
+    weather_forecast = get_weather_forecast(weather_forecast_path)
+
     weather_nowcast = (
         pl.scan_parquet("data/met_nowcast.parquet")
         .select(
             pl.col("windpark").alias("sid"),
             pl.col("time").alias("time_ref"),
             pl.exclude("windpark", "time").name.prefix("now_"),
-            # pl.col('air_temperature_2m').alias("t2m"),
-            # pl.col('air_pressure_at_sea_level').alias("mslp"),
-            # pl.col('relative_humidity_2m').alias("rh2m"),
-            # pl.col('precipitation_amount').alias(""),
-            # pl.col('wind_speed_10m').alias("ws10m"),
-            # pl.col('wind_direction_10m').alias("wd10m"),
         )
         .with_columns(
             now_wind_x=pl.col("now_wind_speed_10m")
-            * (TAU * pl.col("wind_direction_10m") / 360).cos(),
+            * (TAU * pl.col("now_wind_direction_10m") / 360).cos(),
             now_wind_y=pl.col("now_wind_speed_10m")
-            * (TAU * pl.col("wind_direction_10m") / 360).sin(),
+            * (TAU * pl.col("now_wind_direction_10m") / 360).sin(),
             now_air_density=pl.col("now_air_pressure_at_sea_level")
             / (273.15 + pl.col("now_air_temperature_2m")),
             # location_mean_ws=(
@@ -205,28 +186,18 @@ if __name__ == "__main__":
         )
         .with_columns(
             ewm_now_wind_x=pl.col("now_wind_x")
-            .ewm_mean("time", alpha=0.5)
-            .over("sid", order_by="time"),
+            .ewm_mean(alpha=0.5)
+            .over("sid", order_by="time_ref"),
             ewm_now_wind_y=pl.col("now_wind_y")
-            .ewm_mean("time", alpha=0.5)
-            .over("sid", order_by="time"),
+            .ewm_mean(alpha=0.5)
+            .over("sid", order_by="time_ref"),
         )
         .with_columns(
+            now_wind_alignment=(
+                pl.col("ewm_now_wind_x") ** 2 + pl.col("ewm_now_wind_y") ** 2
+            ).sqrt(),
             now_wind_power_density=pl.col("now_air_density")
-            * pl.col("now_wind_speed_10m").clip(0, 20) ** 3
-        )
-    )
-
-    windpower = (
-        (
-            pl.scan_parquet("data/wind_power_per_bidzone.parquet").rename(
-                {"__index_level_0__": "time"}
-            )
-        )
-        .unpivot(index="time", variable_name="bidding_area", value_name="power")
-        .with_columns(
-            (pl.col("bidding_area") == f"ELSPOT NO{k}").alias(f"ELSPOT NO{k}")
-            for k in range(1, 5)
+            * pl.col("now_wind_speed_10m").clip(0, 20) ** 3,
         )
     )
 
@@ -243,9 +214,9 @@ if __name__ == "__main__":
         weather_forecast.join(windparks, left_on="sid", right_on="substation_name")
         .filter(
             pl.col("time_ref") > pl.col("prod_start_new"),
+            pl.col("lt") <= forecast_horizon,
             # pl.col("time_ref") >= date(2021, 1, 1),
         )
-        .join(windpower, on=["bidding_area", "time"], how="left")
         .join(local_windpower, on=["time", "windpark_nve_id"], how="left")
         .join(weather_nowcast, on=["sid", "time_ref"])
         .with_columns(
@@ -255,26 +226,32 @@ if __name__ == "__main__":
             (TAU * doy_frac).cos().alias("cos_doy"),
         )
         .with_columns(
-            *(air_density(em) for em in ENSEMBLE_MEMBERS),
-            *(ws_power_scaled(em) for em in ENSEMBLE_MEMBERS),
-            *(ws_turbine_scaled(em) for em in ENSEMBLE_MEMBERS),
-            *(gust_factor(em) for em in ENSEMBLE_MEMBERS),
-            *(wind_alignment(em) for em in ENSEMBLE_MEMBERS),
+            air_density(),
+            ws_power_scaled(),
+            ws_turbine_scaled(),
+            gust_factor(),
+            wind_alignment(),
         )
-        .with_columns(*(wind_power_density(em) for em in ENSEMBLE_MEMBERS))
-        .with_columns(*(wind_power_density_scaled(em) for em in ENSEMBLE_MEMBERS))
+        .with_columns(wind_power_density())
+        .with_columns(wind_power_density_scaled())
+        .with_columns(
+            local_relative_power=pl.col("local_power") / pl.col("operating_power_max")
+        )
         .select(
             "time_ref",
             "time",
             "sid",
             "windpark_name",
             "bidding_area",
-            "power",
+            "em",
             "local_power",
-            *SHARED_FEATURES,
-            *get_all_ensemble_features(),
+            "local_relative_power",
+            "operating_power_max",
+            "mean_production",
+            "num_turbines",
+            *LOCAL_FEATURES,
         )
         .sort("time_ref", "time", "bidding_area")
     )
 
-    data.sink_parquet("data/windpower_ensemble_dataset.parquet")
+    data.sink_parquet("data/windpower_local_dataset.parquet")
