@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable
 
 import optuna
@@ -17,7 +17,7 @@ def xgb_trial(trial, X_train, X_val, y_train, y_val, w_train, w_val):
         "eval_metric": "rmse",
         "device": "cuda",
         "tree_method": "hist",
-        "learning_rate": 0.1,
+        "learning_rate": 0.03,
     }
     param = {
         **fixed_params,
@@ -38,12 +38,18 @@ def xgb_trial(trial, X_train, X_val, y_train, y_val, w_train, w_val):
         trial, "validation_0-rmse"
     )
     early_stop = xgb.callback.EarlyStopping(  # type: ignore
-        rounds=10, metric_name="rmse", data_name="validation_0", save_best=True
+        rounds=20, metric_name="rmse", data_name="validation_0", save_best=True
     )
     model = xgb.XGBRegressor(
         **param, n_estimators=1000, callbacks=[pruning_callback, early_stop]
     )
-    model.fit(X_train, y_train, sample_weight=w_train, eval_set=[(X_val, y_val)])
+    model.fit(
+        X_train,
+        y_train,
+        sample_weight=w_train,
+        eval_set=[(X_val, y_val)],
+        sample_weight_eval_set=[w_val],
+    )
 
     trial.set_user_attr("fixed_params", fixed_params)
     best_iter = getattr(model, "best_iteration", None)
@@ -68,7 +74,12 @@ def get_split_data(
     data_train = data.filter(pl.col("time_ref") < val_start_date).filter(
         pl.col("em") == 0
     )
-    data_val = data.filter(pl.col("time_ref") >= val_start_date)
+    data_val = data.filter(
+        pl.col("time_ref") >= val_start_date,
+        # pl.col("time") >= pl.col("time_ref").dt.date() + timedelta(days=1),
+        # pl.col("time") < pl.col("time_ref").dt.date() + timedelta(days=2),
+        pl.col("time").dt.date() == (pl.col("time_ref") + timedelta(days=2)).dt.date(),
+    )
 
     X_train = data_train.select(features).collect()
     X_val = data_val.select(features).collect()
@@ -87,7 +98,7 @@ def get_split_data(
 
 def tune_xgb_model(X_train, X_val, y_train, y_val, w_train, w_val, study_name):
     study = optuna.create_study(
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=25),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=200),
         direction="minimize",
         study_name=study_name,
         storage="sqlite:///optuna.db",
@@ -97,7 +108,7 @@ def tune_xgb_model(X_train, X_val, y_train, y_val, w_train, w_val, study_name):
     def objective(trial):
         return xgb_trial(trial, X_train, X_val, y_train, y_val, w_train, w_val)
 
-    study.optimize(objective, n_trials=100)
+    study.optimize(objective, n_trials=30)
     print(study.best_trial)
 
     best_params = study.best_params
@@ -115,9 +126,9 @@ def main():
     target = "local_relative_power"
     weight = "operating_power_max"
 
-    study_name = "em0_model_xgb_2"
+    study_name = "em0_geo_features_xgb_3"
     data = pl.scan_parquet(dataset_path).filter(
-        pl.col(target).is_not_null(), pl.col("lt") <= 48
+        pl.col(target).is_not_null(), pl.col("lt") > 0
     )
 
     X_train, X_val, y_train, y_val, w_train, w_val = get_split_data(
@@ -137,7 +148,7 @@ def main_area():
 
     study_name = "em0_area_model_xgb_2"
     data = pl.scan_parquet(dataset_path).filter(
-        pl.col(target).is_not_null(), pl.col("lt") <= 48
+        pl.col(target).is_not_null(), pl.col("lt") > 0
     )
 
     X_train, X_val, y_train, y_val, w_train, w_val = get_split_data(

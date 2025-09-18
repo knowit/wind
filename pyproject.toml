@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "cf-xarray>=0.10.7",
     "ipywidgets>=8.1.7",
+    "jq>=1.10.0",
     "matplotlib>=3.10.5",
     "notebook>=7.4.5",
     "numpy>=2.2.6",
@@ -21,6 +22,7 @@ dependencies = [
     "ruff>=0.12.7",
     "scikit-learn>=1.7.1",
     "scipy>=1.16.1",
+    "seaborn>=0.13.2",
     "statsforecast>=2.0.1",
     "statsmodels>=0.14.5",
     "tensorboard>=2.20.0",
@@ -37,6 +39,7 @@ bayes = [
     "numpyro>=0.19.0",
     "nutpie>=0.15.2",
     "graphviz>=0.21",
+    "torchbnn>=1.2",
 ]
 geopandas = [
     "geopandas>=1.1.1",

@@ -1,5 +1,7 @@
-import numpy as np
+from datetime import datetime
+
 import polars as pl
+import requests
 
 ENSEMBLE_MEMBERS = list(range(15))
 
@@ -11,15 +13,9 @@ AREA_FEATURES = [
     "recent_min",
     "recent_range",
     "recent_std",
-    "ELSPOT NO1",
-    "ELSPOT NO2",
-    "ELSPOT NO3",
-    "ELSPOT NO4",
-    "sin_hod",
-    "cos_hod",
-    "sin_doy",
-    "cos_doy",
     "lt",
+    "unplannedEvent",
+    "unavailable_transmission",
 ]
 
 EMOS_FEATURES = [
@@ -27,6 +23,10 @@ EMOS_FEATURES = [
     "std_sum_pred",
     "min_sum_pred",
     "max_sum_pred",
+    "pred_lag1",
+    "pred_lag2",
+    "pred_lead1",
+    "pred_lead2",
 ]
 
 
@@ -35,7 +35,7 @@ def get_area_capacity(path, times):
 
     area_capacity = (
         times.join(max_capacity, how="cross")
-        .filter(pl.col("time") >= pl.col("prod_start_new"))
+        .filter(pl.col("time") >= pl.col("production_start_date"))
         .group_by(pl.col("time").alias("time_ref"), "bidding_area")
         .agg(
             operating_power_max=pl.col("operating_power_max").sum(),
@@ -44,6 +44,115 @@ def get_area_capacity(path, times):
         )
     )
     return area_capacity
+
+
+def add_unavailable_transmission(df: pl.LazyFrame) -> pl.LazyFrame:
+    messages = []
+    skip = 0
+    while True:
+        res = requests.get(
+            "https://ummapi.nordpoolgroup.com/messages",
+            params={
+                "limit": 2000,
+                "messageTypes": "TransmissionUnavailability",
+                "areas": [
+                    "10YNO-1--------2",
+                    "10YNO-2--------T",
+                    "10YNO-3--------J",
+                    "10YNO-4--------9",
+                ],
+                "skip": skip,
+            },
+        )
+        if res.status_code != 200:
+            print(res.status_code)
+            break
+
+        content = res.json()
+        if len(content["items"]) == 0:
+            break
+        messages.extend(content["items"])
+        skip += len(content["items"])
+        print(
+            f"Retrieved: {len(content['items'])} ---- Progress: {skip}/{content['total']}"
+        )
+        if skip >= content["total"]:
+            break
+
+    transmission = (
+        pl.json_normalize(messages, infer_schema_length=1000)
+        .filter(pl.col("messageType") == 3)
+        .explode("transmissionUnits")
+        .with_columns(
+            # pl.col("eventStart").cast(pl.Datetime).alias("transmissionEventStart"),
+            # pl.col("eventStop").cast(pl.Datetime).alias("transmissionEventStop"),
+            (pl.col("unavailabilityType") == 1).alias("unplannedEvent"),
+            pl.col("publicationDate").cast(pl.Datetime),
+            inAreaName=pl.col("transmissionUnits").struct.field("inAreaName"),
+            outAreaName=pl.col("transmissionUnits").struct.field("outAreaName"),
+            installedCapacity=pl.col("transmissionUnits").struct.field(
+                "installedCapacity"
+            ),
+            timePeriods=pl.col("transmissionUnits").struct.field("timePeriods"),
+        )
+        .filter(pl.col("outAreaName").is_in(["NO1", "NO2", "NO3", "NO4"]))
+        .explode("timePeriods")
+        .with_columns(
+            unavailableCapacity=pl.col("timePeriods").struct.field(
+                "unavailableCapacity"
+            ),
+            availableCapacity=pl.col("timePeriods").struct.field("availableCapacity"),
+            eventStart=pl.col("timePeriods")
+            .struct.field("eventStart")
+            .cast(pl.Datetime),
+            eventStop=pl.col("timePeriods").struct.field("eventStop").cast(pl.Datetime),
+        )
+        .filter(pl.col("eventStop") > datetime(2020, 1, 1))
+        .select(
+            "outAreaName",
+            "inAreaName",
+            "unplannedEvent",
+            "installedCapacity",
+            "unavailableCapacity",
+            "availableCapacity",
+            "publicationDate",
+            "eventStart",
+            "eventStop",
+        )
+        .lazy()
+    )
+
+    unavailable_transmission = (
+        df.select("time_ref", "time", "bidding_area")
+        .unique()
+        .join(
+            transmission,
+            left_on=pl.col("bidding_area").str.tail(3),
+            right_on="outAreaName",
+            how="left",
+        )
+        .filter(
+            pl.col("time_ref") > pl.col("publicationDate"),
+            pl.col("time") >= pl.col("eventStart"),
+            pl.col("time") <= pl.col("eventStop"),
+        )
+        .group_by("time_ref", "time", "bidding_area")
+        .agg(
+            pl.col("unplannedEvent").max(),
+            pl.col("unavailableCapacity").sum(),
+            pl.col("installedCapacity").sum(),
+        )
+        .with_columns(
+            unavailable_transmission=pl.col("unavailableCapacity")
+            / pl.col("installedCapacity")
+        )
+    )
+    return df.join(
+        unavailable_transmission, on=["time_ref", "time", "bidding_area"], how="left"
+    ).with_columns(
+        pl.col("unplannedEvent").fill_null(False),
+        pl.col("unavailable_transmission").fill_null(0),
+    )
 
 
 def get_emos_dataset():
@@ -65,7 +174,7 @@ def get_emos_dataset():
         relative_power=pl.col("power") / pl.col("operating_power_max"),
     )
 
-    recent_window = 5
+    recent_window = 24
     windpower_features = (
         windpower.rename({"time": "time_ref"})
         .sort("time_ref")
@@ -102,14 +211,9 @@ def get_emos_dataset():
 
     aggregated_local_preds = (
         pl.scan_parquet(local_pred_path)
-        .group_by("time_ref", "time", "bidding_area", "em")
+        .group_by("time_ref", "time", "lt", "bidding_area", "em")
         .agg(sum_local_pred=pl.col("local_power_pred").sum())
     )
-
-    TAU = 2 * np.pi
-    hour_frac = pl.col("time").dt.hour().cast(pl.Float64) / 24.0
-    doy = pl.col("time").dt.ordinal_day().cast(pl.Float64)
-    doy_frac = (doy - 1 + hour_frac) / 365.2425
 
     emos_dataset = (
         aggregated_local_preds.join(area_capacity, on=["time_ref", "bidding_area"])
@@ -117,7 +221,7 @@ def get_emos_dataset():
         .with_columns(
             sum_local_pred=pl.col("sum_local_pred") / pl.col("operating_power_max"),
         )
-        .group_by("time_ref", "time", "bidding_area")
+        .group_by("time_ref", "time", "lt", "bidding_area")
         .agg(
             power=pl.col("power").first(),
             relative_power=pl.col("relative_power").first(),
@@ -129,18 +233,22 @@ def get_emos_dataset():
             min_sum_pred=pl.col("sum_local_pred").min(),
             max_sum_pred=pl.col("sum_local_pred").max(),
         )
+        .with_columns(
+            pred_lag1=pl.col("mean_sum_pred")
+            .shift(1)
+            .over(["time_ref", "bidding_area"], order_by="time"),
+            pred_lag2=pl.col("mean_sum_pred")
+            .shift(2)
+            .over(["time_ref", "bidding_area"], order_by="time"),
+            pred_lead1=pl.col("mean_sum_pred")
+            .shift(-1)
+            .over(["time_ref", "bidding_area"], order_by="time"),
+            pred_lead2=pl.col("mean_sum_pred")
+            .shift(-2)
+            .over(["time_ref", "bidding_area"], order_by="time"),
+        )
         .join(windpower_features, on=["time_ref", "bidding_area"])
-        .with_columns(
-            sin_hod=(TAU * hour_frac).sin(),
-            cos_hod=(TAU * hour_frac).cos(),
-            sin_doy=(TAU * doy_frac).sin(),
-            cos_doy=(TAU * doy_frac).cos(),
-            lt=(pl.col("time") - pl.col("time_ref")).dt.total_hours(),
-        )
-        .with_columns(
-            (pl.col("bidding_area") == f"ELSPOT NO{k}").alias(f"ELSPOT NO{k}")
-            for k in range(1, 5)
-        )
+        .pipe(add_unavailable_transmission)
         .sort("time_ref", "time", "bidding_area")
         .select(
             "time_ref",
@@ -159,6 +267,10 @@ def get_emos_dataset():
     return emos_dataset
 
 
-if __name__ == "__main__":
+def main():
     dataset = get_emos_dataset()
     dataset.sink_parquet("data/windpower_area_dataset.parquet")
+
+
+if __name__ == "__main__":
+    main()

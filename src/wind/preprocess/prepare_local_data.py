@@ -1,10 +1,18 @@
+from datetime import date
+
 import numpy as np
 import polars as pl
+import requests
 
 ENSEMBLE_MEMBERS = list(range(15))
 
 LOCAL_FEATURES = [
     "lt",
+    "mean_hub_height",
+    "mean_rotor_diameter",
+    "unavailable_capacity",
+    "elevation",
+    "ruggedness",
     "ELSPOT NO1",
     "ELSPOT NO2",
     "ELSPOT NO3",
@@ -29,47 +37,105 @@ LOCAL_FEATURES = [
     "rh2m",
     "mslp",
     "g10m",
-    "wind_alignment",
-    "air_density",
-    "gust_factor",
+    "wshh",
+    "adhh",
+    "phh",
     "wind_power_density",
+    "wind_alignment",
+    "gust_factor",
 ]
+
+TAU = 2 * np.pi
+
+
+def wind_speed_at_hub_height() -> pl.Expr:
+    """Wind speed at hub height"""
+    alpha = 0.143  # Empirically derived coefficient for estimating wind speed at different heights
+    # See: https://en.wikipedia.org/wiki/Wind_profile_power_law
+    return (pl.col("ws10m") * ((pl.col("mean_hub_height") / 10) ** alpha)).alias("wshh")
+
+
+def hub_height_variables():
+    # constants
+    g = 9.80665  # m/s^2
+    Rd = 287.05  # J/(kg*K)
+    eps = 0.622
+
+    wshh = wind_speed_at_hub_height()
+
+    # optional lapse adjustment to hub height temperature
+    T_layer = pl.col("t2m") + 273.15 - 0.0065 * pl.col("mean_hub_height")
+
+    # 2) vapor pressure from RH (Magnus-Bolton)
+    es_hPa = 6.112 * ((17.67 * pl.col("t2m")) / (pl.col("t2m") + 243.5)).exp()
+    e = (pl.col("rh2m") / 100.0) * es_hPa * 100.0  # Pa
+
+    # 3) preliminary station pressure at ground (dry)
+    pmsl = pl.col("mslp") * 100.0  # Pa
+
+    p0_dry = pmsl * (-g * pl.col("elevation") / (Rd * T_layer)).exp()
+
+    # specific humidity using p0_dry
+    q = eps * e / (p0_dry - (1 - eps) * e)
+    Tv = T_layer * (1 + 0.61 * q)
+
+    # 4) pressure at hub height
+    phh = (
+        pmsl
+        * (-g * (pl.col("elevation") + pl.col("mean_hub_height")) / (Rd * Tv)).exp()
+    )
+
+    # if iterate:
+    #     # one quick iteration
+    #     q = eps * e / (phh - (1 - eps) * e)
+    #     Tv = T_layer * (1 + 0.61*q)
+    #     phh = pmsl * np.exp(-g * (H + z) / (Rd * Tv))
+
+    # 5) density
+    rho_hh = phh / (Rd * Tv)
+    wpd = 0.5 * rho_hh * (wshh.clip(0, 25) ** 3)
+    return (
+        wshh.alias("wshh"),
+        rho_hh.alias("adhh"),
+        phh.alias("phh"),
+        wpd.alias("wind_power_density"),
+    )
 
 
 def air_density() -> pl.Expr:
     return (pl.col("mslp") / (273.15 + pl.col("t2m"))).alias("air_density")
 
 
-def wind_x() -> pl.Expr:
-    return (pl.col("ws10m") * (TAU * pl.col("wd10m") / 360).cos()).alias("wind_x")
+def wind_power_density(wind_col="ws10m") -> pl.Expr:
+    return (pl.col("air_density") * pl.col(wind_col).clip(0, 20) ** 3).alias(
+        "wind_power_density"
+    )
 
 
-def wind_y() -> pl.Expr:
-    return (pl.col("ws10m") * (TAU * pl.col("wd10m") / 360).sin()).alias("wind_y")
+def wind_x(wind_col="ws10m") -> pl.Expr:
+    return (pl.col(wind_col) * (TAU * pl.col("wd10m") / 360).cos()).alias("wind_x")
 
 
-def ws_power_scaled() -> pl.Expr:
-    return (pl.col("ws10m") * pl.col("operating_power_max")).alias("ws_power_scaled")
-
-
-def ws_turbine_scaled() -> pl.Expr:
-    return (pl.col("ws10m") * pl.col("num_turbines")).alias("ws_turbine_scaled")
+def wind_y(wind_col="ws10m") -> pl.Expr:
+    return (pl.col(wind_col) * (TAU * pl.col("wd10m") / 360).sin()).alias("wind_y")
 
 
 def gust_factor() -> pl.Expr:
     return (pl.col("g10m") / pl.col("ws10m")).alias("gust_factor")
 
 
-def wind_alignment() -> pl.Expr:
+def wind_alignment(wind_col="ws10m") -> pl.Expr:
+    wind_x_comp = wind_x(wind_col)
+    wind_y_comp = wind_y(wind_col)
     return (
         (
-            pl.col("wind_x")
-            .rolling_mean(3, min_samples=1, center=True)
-            .over(["time_ref", "windpark_name"], order_by="lt")
+            wind_x_comp.rolling_mean(3, min_samples=1, center=True).over(
+                ["time_ref", "windpark_nve"], order_by="lt"
+            )
             ** 2
-            + pl.col("wind_y")
-            .rolling_mean(3, min_samples=1, center=True)
-            .over(["time_ref", "windpark_name"], order_by="lt")
+            + wind_y_comp.rolling_mean(3, min_samples=1, center=True).over(
+                ["time_ref", "windpark_nve"], order_by="lt"
+            )
             ** 2
         )
         .sqrt()
@@ -77,21 +143,26 @@ def wind_alignment() -> pl.Expr:
     )
 
 
-def wind_power_density() -> pl.Expr:
-    return (pl.col("air_density") * pl.col("ws10m").clip(0, 20) ** 3).alias(
-        "wind_power_density"
+def seasonal_features(time_col: str) -> tuple[pl.Expr, pl.Expr, pl.Expr, pl.Expr]:
+    hour_frac = pl.col(time_col).dt.hour().cast(pl.Float64) / 24.0
+    doy = pl.col(time_col).dt.ordinal_day().cast(pl.Float64)
+    doy_frac = (doy - 1 + hour_frac) / 365.2425
+    return (
+        (TAU * hour_frac).sin().alias("sin_hod"),
+        (TAU * hour_frac).cos().alias("cos_hod"),
+        (TAU * doy_frac).sin().alias("sin_doy"),
+        (TAU * doy_frac).cos().alias("cos_doy"),
     )
 
 
-def wind_power_density_scaled() -> pl.Expr:
-    return (pl.col("wind_power_density") * pl.col("operating_power_max")).alias(
-        "wind_power_density_scaled"
-    )
+def bidding_area_dummies() -> list[pl.Expr]:
+    return [
+        (pl.col("bidding_area") == f"ELSPOT NO{k}").alias(f"ELSPOT NO{k}")
+        for k in range(1, 5)
+    ]
 
 
 def get_local_windpower(path: str) -> pl.LazyFrame:
-    from datetime import date
-
     local_windpower = pl.scan_csv(
         path,
         separator=";",
@@ -124,11 +195,22 @@ def get_local_windpower(path: str) -> pl.LazyFrame:
     return local_windpower
 
 
-def get_weather_forecast(path: str) -> pl.LazyFrame:
+def get_weather_forecast(path: str, evaluation_path: str | None = None) -> pl.LazyFrame:
+    data = pl.scan_parquet(path)
+    if evaluation_path is not None:
+        evaluation_data = pl.scan_csv(
+            evaluation_path, schema=data.collect_schema(), null_values="NA"
+        )
+        # for c1, c2 in zip(data.collect_schema(), evaluation_data.collect_schema()):
+        #     if c1 != c2:
+        #         print("--->", end="")
+        #     print(c1, c2)
+        data = pl.concat([data, evaluation_data])
+
     weather_forecast_ensemble_data = []
     for em in ENSEMBLE_MEMBERS:
-        em_weather_forecast = pl.scan_parquet(path).select(
-            "sid",
+        em_weather_forecast = data.select(
+            pl.col("sid").alias("windpark_statnet"),
             "time_ref",
             "time",
             "lt",
@@ -142,28 +224,22 @@ def get_weather_forecast(path: str) -> pl.LazyFrame:
         )
         weather_forecast_ensemble_data.append(em_weather_forecast)
 
-    weather_forecast = pl.concat(weather_forecast_ensemble_data).with_columns(
-        wind_x(), wind_y()
-    )
+    weather_forecast = pl.concat(weather_forecast_ensemble_data)
     return weather_forecast
 
 
-if __name__ == "__main__":
-    forecast_horizon = 48
-    weather_forecast_path = "data/met_forecast.parquet"
-    weather_nowcast_path = "data/met_nowcast.parquet"
-
-    TAU = 2 * np.pi
-    hour = pl.col("time").dt.hour().cast(pl.Float64)  # 0..23
-    doy = pl.col("time").dt.ordinal_day().cast(pl.Float64)  # 1..365/366
-    doy_frac = (doy - 1 + hour / 24.0) / 365.2425  # ~[0,1)
-
-    weather_forecast = get_weather_forecast(weather_forecast_path)
-
+def get_weather_nowcast(path: str, evaluation_path: str | None = None) -> pl.LazyFrame:
+    data = pl.scan_parquet(path)
+    if evaluation_path is not None:
+        evaluation_data = pl.scan_parquet(evaluation_path)
+        # for c1, c2 in zip(data.collect_schema(), evaluation_data.collect_schema()):
+        #     if c1 != c2:
+        #         print("---> ", end="")
+        #     print(c1, c2)
+        data = pl.concat([data, evaluation_data])
     weather_nowcast = (
-        pl.scan_parquet("data/met_nowcast.parquet")
-        .select(
-            pl.col("windpark").alias("sid"),
+        data.select(
+            pl.col("windpark").alias("windpark_statnet"),
             pl.col("time").alias("time_ref"),
             pl.exclude("windpark", "time").name.prefix("now_"),
         )
@@ -177,20 +253,20 @@ if __name__ == "__main__":
             # location_mean_ws=(
             #     pl.col("now_wind_speed_10m").cum_sum()
             #     / pl.col("now_wind_speed_10m").cum_count()
-            # ).over(partition_by="sid", order_by="time_ref"),
+            # ).over(partition_by="windpark_statnet", order_by="time_ref"),
             # The commented calculation is more correct to avoid information leakage,
             # but this is much easier to compute
             location_mean_ws=pl.col("now_wind_speed_10m")
             .mean()
-            .over(partition_by="sid"),
+            .over(partition_by="windpark_statnet"),
         )
         .with_columns(
             ewm_now_wind_x=pl.col("now_wind_x")
             .ewm_mean(alpha=0.5)
-            .over("sid", order_by="time_ref"),
+            .over("windpark_statnet", order_by="time_ref"),
             ewm_now_wind_y=pl.col("now_wind_y")
             .ewm_mean(alpha=0.5)
-            .over("sid", order_by="time_ref"),
+            .over("windpark_statnet", order_by="time_ref"),
         )
         .with_columns(
             now_wind_alignment=(
@@ -200,48 +276,149 @@ if __name__ == "__main__":
             * pl.col("now_wind_speed_10m").clip(0, 20) ** 3,
         )
     )
+    return weather_nowcast
 
-    local_windpower = get_local_windpower("data/windpower2002-2024_utcplus1.csv")
 
-    windparks = pl.scan_csv(
-        "data/windparks_enriched.csv", try_parse_dates=True
-    ).with_columns(
-        (pl.col("bidding_area") == f"ELSPOT NO{k}").alias(f"ELSPOT NO{k}")
-        for k in range(1, 5)
+def get_outages() -> pl.DataFrame:
+    areas = [
+        {"name": "NO1", "code": "10YNO-1--------2"},
+        {"name": "NO2", "code": "10YNO-2--------T"},
+        {"name": "NO3", "code": "10YNO-3--------J"},
+        {"name": "NO4", "code": "10YNO-4--------9"},
+    ]
+    messages = []
+    skip = 0
+    while True:
+        res = requests.get(
+            "https://ummapi.nordpoolgroup.com/messages",
+            params={
+                "limit": 2000,
+                "messageTypes": "ProductionUnavailability",
+                "areas": [a["code"] for a in areas],
+                "fuelTypes": 19,
+                "skip": skip,
+            },
+        )
+        if res.status_code != 200:
+            print(res.status_code)
+            break
+
+        content = res.json()
+        if len(content["items"]) == 0:
+            break
+        messages.extend(content["items"])
+        skip += len(content["items"])
+        if skip >= content["total"]:
+            break
+
+    production = (
+        pl.json_normalize(messages, infer_schema_length=1000)
+        .filter(pl.col("messageType") == 1, pl.col("generationUnits").is_null())
+        .explode("productionUnits")
+        .select(
+            pl.col("publicationDate").cast(pl.Datetime),
+            pl.col("productionUnits").struct.field("eic").alias("eic"),
+            pl.col("productionUnits")
+            .struct.field("installedCapacity")
+            .alias("installedCapacity"),
+            pl.col("productionUnits").struct.field("timePeriods").alias("timePeriods"),
+        )
+        .explode("timePeriods")
+        .with_columns(
+            pl.col("timePeriods")
+            .struct.field("unavailableCapacity")
+            .alias("unavailableCapacity"),
+            pl.col("timePeriods")
+            .struct.field("availableCapacity")
+            .alias("availableCapacity"),
+            pl.col("timePeriods")
+            .struct.field("eventStart")
+            .cast(pl.Datetime)
+            .alias("eventStart"),
+            pl.col("timePeriods")
+            .struct.field("eventStop")
+            .cast(pl.Datetime)
+            .alias("eventStop"),
+        )
+    )
+    return production
+
+
+def add_outages(df: pl.LazyFrame) -> pl.LazyFrame:
+    eic_lookup = (
+        pl.scan_csv("data/windparks_lookup.csv")
+        .select("windpark_nve_id", "eic_code")
+        .unique()
+    )
+    outages = get_outages().lazy().join(eic_lookup, left_on="eic", right_on="eic_code")
+    windparks_times = df.select("time_ref", "time", "windpark_nve_id").unique()
+    outage_periods = (
+        windparks_times.join(outages, on="windpark_nve_id")
+        .filter(
+            pl.col("time_ref") > pl.col("publicationDate"),
+            pl.col("time") >= pl.col("eventStart"),
+            pl.col("time") <= pl.col("eventStop"),
+        )
+        .group_by("time_ref", "time", "windpark_nve_id")
+        .agg(
+            pl.col("unavailableCapacity").sum(),
+            pl.col("installedCapacity").sum(),
+            pl.col("availableCapacity").sum(),
+        )
+        .with_columns(
+            unavailable_capacity=pl.col("unavailableCapacity")
+            / pl.col("installedCapacity")
+        )
+    )
+    return df.join(
+        outage_periods, on=["time_ref", "time", "windpark_nve_id"], how="left"
+    ).with_columns(unavailable_capacity=pl.col("unavailable_capacity").fill_null(0.0))
+
+
+def main():
+    weather_forecast = get_weather_forecast(
+        "data/met_forecast.parquet", evaluation_path="data/met_forecast_daily/*"
+    )
+    weather_nowcast = get_weather_nowcast(
+        "data/met_nowcast.parquet", evaluation_path="data/met_nowcast_daily/*"
     )
 
+    local_windpower = get_local_windpower("data/windpower2002-2024_utcplus1.csv").drop(
+        "windpark_nve"
+    )
+    windparks = pl.scan_csv("data/windparks_enriched.csv", try_parse_dates=True)
+
+    time_index = weather_forecast.select("time_ref", "time").unique()
+
     data = (
-        weather_forecast.join(windparks, left_on="sid", right_on="substation_name")
+        windparks.join(time_index, how="cross")
+        .join(local_windpower, on=["windpark_nve_id", "time"], how="left")
+        .join(windparks, on="windpark_nve_id", how="left")
+        .join(weather_forecast, on=["windpark_statnet", "time_ref", "time"], how="left")
+        .join(weather_nowcast, on=["windpark_statnet", "time_ref"], how="left")
         .filter(
-            pl.col("time_ref") > pl.col("prod_start_new"),
-            pl.col("lt") <= forecast_horizon,
-            # pl.col("time_ref") >= date(2021, 1, 1),
+            pl.col("time_ref") > pl.col("production_start_date"),
         )
-        .join(local_windpower, on=["time", "windpark_nve_id"], how="left")
-        .join(weather_nowcast, on=["sid", "time_ref"])
+        .pipe(add_outages)
         .with_columns(
-            (TAU * hour / 24.0).sin().alias("sin_hod"),
-            (TAU * hour / 24.0).cos().alias("cos_hod"),
-            (TAU * doy_frac).sin().alias("sin_doy"),
-            (TAU * doy_frac).cos().alias("cos_doy"),
-        )
-        .with_columns(
-            air_density(),
-            ws_power_scaled(),
-            ws_turbine_scaled(),
+            # wshh(),
+            # air_density(),
             gust_factor(),
-            wind_alignment(),
+            *hub_height_variables(),
+            *seasonal_features("time"),
+            *bidding_area_dummies(),
         )
-        .with_columns(wind_power_density())
-        .with_columns(wind_power_density_scaled())
+        .with_columns(
+            wind_alignment("wshh"),
+            # wind_power_density("wshh"),
+        )
         .with_columns(
             local_relative_power=pl.col("local_power") / pl.col("operating_power_max")
         )
         .select(
             "time_ref",
             "time",
-            "sid",
-            "windpark_name",
+            pl.col("windpark_nve").alias("windpark"),
             "bidding_area",
             "em",
             "local_power",
@@ -255,3 +432,7 @@ if __name__ == "__main__":
     )
 
     data.sink_parquet("data/windpower_local_dataset.parquet")
+
+
+if __name__ == "__main__":
+    main()

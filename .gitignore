@@ -16,4 +16,5 @@ runs/
 runs_all_zones/
 output/
 optuna_summaries/
+plots/
 *.db

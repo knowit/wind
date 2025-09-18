@@ -31,8 +31,8 @@ class LocalPowerModel:
     def fit(self, data: pl.LazyFrame, **fit_kwargs) -> Self:
         self.valid_time = data.select(pl.col("time_ref").max()).collect().item()
         X = data.select(self.features).collect()
-        y = data.select(target).collect().to_series()
-        w = data.select(weight).collect().to_series()
+        y = data.select(self.target).collect().to_series()
+        w = data.select(self.weight).collect().to_series()
         self.estimator = self.get_estimator()
         self.estimator.fit(X, y, sample_weight=w, **fit_kwargs)
         return self
@@ -46,7 +46,7 @@ class LocalPowerModel:
             raise NotFittedError()
 
         X_pred = data.select(self.features).collect()
-        w_pred = data.select(weight).collect().to_series()
+        w_pred = data.select(self.weight).collect().to_series()
         y_pred = self.estimator.predict(X_pred)
         return y_pred * w_pred
 
@@ -176,27 +176,27 @@ def get_hparams(study_name: str) -> dict[str, Any]:
     return hparams
 
 
-if __name__ == "__main__":
-    prediction_horizon = 48
+def main():
     target = "local_relative_power"
     weight = "operating_power_max"
     dataset_path = "data/windpower_local_dataset.parquet"
-
-    # # ---- Single Model ----
-    # study_name = "single_model_xgb_1"
-    # output_path = "data/single_model_pred.parquet"
-    # id_cols = ["time_ref", "time", "sid", "windpark_name", "bidding_area", "em"]
-    # hparams = get_hparams(study_name)
-    # data = pl.scan_parquet(dataset_path).filter(pl.col("lt") <= prediction_horizon)
-    # train_and_predict = train_predict_single_model(FEATURES, target, hparams)
-
-    # ---- Model Per EM ----
-    study_name = "em0_model_xgb_1"
+    study_name = "em0_geo_features_xgb_3"
     output_path = "data/em0_model_pred.parquet"
-    id_cols = ["time_ref", "time", "sid", "windpark_name", "bidding_area", "em"]
+    id_cols = [
+        "time_ref",
+        "time",
+        "lt",
+        "windpark",
+        "bidding_area",
+        "em",
+    ]
     hparams = get_hparams(study_name)
-    data = pl.scan_parquet(dataset_path).filter(pl.col("lt") <= prediction_horizon)
+    data = pl.scan_parquet(dataset_path)
     train_and_predict = train_predict_em0_model(LOCAL_FEATURES, target, weight, hparams)
 
     preds = rolling_monthly_prediction(data, target, id_cols, train_and_predict)
     preds.write_parquet(output_path)
+
+
+if __name__ == "__main__":
+    main()
