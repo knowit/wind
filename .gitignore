@@ -9,7 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-data/
+data/*
+!data/windparks_enriched.csv
+
 checkpoints/
 hparams/
 runs/

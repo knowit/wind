@@ -377,10 +377,10 @@ def add_outages(df: pl.LazyFrame) -> pl.LazyFrame:
 
 def main():
     weather_forecast = get_weather_forecast(
-        "data/met_forecast.parquet", evaluation_path="data/met_forecast_daily/*"
+        "data/met_forecast.parquet"  # , evaluation_path="data/met_forecast_daily/*"
     )
     weather_nowcast = get_weather_nowcast(
-        "data/met_nowcast.parquet", evaluation_path="data/met_nowcast_daily/*"
+        "data/met_nowcast.parquet"  # , evaluation_path="data/met_nowcast_daily/*"
     )
 
     local_windpower = get_local_windpower("data/windpower2002-2024_utcplus1.csv").drop(

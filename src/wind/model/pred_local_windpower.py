@@ -162,6 +162,7 @@ def train_predict_em0_model(
 def get_hparams(study_name: str) -> dict[str, Any]:
     try:
         with open(f"hparams/{study_name}.json") as f:
+            print("Loading model parameters from:", f"hparams/{study_name}.json")
             hparams = json.load(f)
     except FileNotFoundError:
         import optuna
