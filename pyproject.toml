@@ -8,7 +8,6 @@ dependencies = [
     "cf-xarray>=0.10.7",
     "ipywidgets>=8.1.7",
     "jq>=1.10.0",
-    "jupyter>=1.1.1",
     "matplotlib>=3.10.5",
     "nbconvert>=7.16.6",
     "notebook>=7.4.5",
@@ -37,11 +36,9 @@ dependencies = [
 [project.optional-dependencies]
 bayes = [
     "pymc>=5.25.1",
-    "jax[cuda12]>=0.7.1",
     "numpyro>=0.19.0",
     "nutpie>=0.15.2",
     "graphviz>=0.21",
-    "torchbnn>=1.2",
 ]
 geopandas = [
     "geopandas>=1.1.1",
@@ -53,8 +50,6 @@ geopandas = [
 [tool.ruff]
 extend-include = ["*.ipynb"]
 
-[[tool.uv.index]]
-url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
 
 [project.scripts]
 wind = "wind:main"
