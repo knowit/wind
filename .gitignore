@@ -20,3 +20,4 @@ output/
 optuna_summaries/
 plots/
 *.db
+*.pdf
