@@ -82,6 +82,7 @@ class BayesianAreaModel:
 
 
 def get_emos_features(data) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    min_lt = 39
     max_lt = 62
     X_mu = (
         data.select(
@@ -107,7 +108,7 @@ def get_emos_features(data) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndar
         data.select(
             pl.lit(1).alias("intercept"),
             pl.col("std_sum_pred").log().alias("log_std_sum_pred"),
-            (pl.col("lt") / max_lt).alias("lt"),
+            ((pl.col("lt") - min_lt) / (max_lt - min_lt)).alias("lt"),
             "mean_sum_pred",
             (pl.col("max_sum_pred") - pl.col("min_sum_pred"))
             .log()
